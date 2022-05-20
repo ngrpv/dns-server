@@ -1,3 +1,5 @@
+import json
+import os.path
 import socket
 import struct
 from typing import Literal
@@ -43,7 +45,7 @@ def decode_question_section(message, offset, qdcount):
         qtype, qclass = DNS_QUERY_SECTION_FORMAT.unpack_from(message, offset)
         offset += DNS_QUERY_SECTION_FORMAT.size
 
-        question = {"domain_name": qname,
+        question = {"domain_name": '.'.join(map(lambda x: x.decode(), qname)),
                     "query_type": qtype,
                     "query_class": qclass}
 
@@ -78,12 +80,12 @@ def parse_ip(data: bytes):
     ''.join([str(i) for i in ip])
 
 
-A_Format = struct.Struct('')
+A_Format = struct.Struct('!4B')
 
 DNS_ANS_EXTRA_FORMAT = struct.Struct('!IH')
 
 
-def parse_answer_data(message: bytes, offset: int):
+def parse_data_with_pointer(message: bytes, offset: int):
     name_head = []
     while True:
         current_byte, = struct.unpack_from("!B", message, offset)
@@ -94,15 +96,44 @@ def parse_answer_data(message: bytes, offset: int):
             offset += 1
             offset_to_name_tail, = struct.unpack_from("!B", message, offset)
             name, _ = decode_labels(message, offset_to_name_tail)
-            return [str.encode(''.join(name_head))] + name, offset + 1
+            if len(name_head) > 0:
+                return [str.encode(''.join(name_head))] + name, offset + 1
+            return name, offset + 1
         name_head.append(chr(current_byte))
+        offset += 1
+
+
+def decode_ns_type_data(message, offset, data_length):
+    data, _ = parse_data_with_pointer(message, offset)
+    offset += data_length
+    return '.'.join(map(lambda x: x.decode(), data)), offset
+
+
+def decode_a_type_data(message, offset, data_length):
+    data = A_Format.unpack_from(message, offset)
+    return '.'.join(map(str, data)), offset + data_length
+
+
+def decode_ptr_data(message, offset, data_length):
+    off = offset
+    acc = []
+    i = 0
+    while True:
+        current_byte, = struct.unpack_from("!c", message, offset)
+        if current_byte == b'\x00' or offset >= off + data_length:
+            return ''.join(acc), off + data_length
+        if current_byte != b'\x03' and current_byte != b'\x05':
+            if str.isprintable(current_byte.decode()):
+                acc.append(current_byte.decode())
+        else:
+            acc.append('.')
         offset += 1
 
 
 def decode_answers_section(message, offset, count, questions):
     answers = []
     for _ in range(count):
-        name, offset = parse_answer_data(message, offset)
+        name, offset = parse_data_with_pointer(message, offset)
         if name == b'':
             name = questions[0]['domain_name']
         atype, ans_class = DNS_QUERY_SECTION_FORMAT.unpack_from(message,
@@ -110,14 +141,20 @@ def decode_answers_section(message, offset, count, questions):
         offset += DNS_QUERY_SECTION_FORMAT.size
         ttl, data_length = DNS_ANS_EXTRA_FORMAT.unpack_from(message, offset)
         offset += DNS_ANS_EXTRA_FORMAT.size
-        data, _ = parse_answer_data(message, offset)
-        offset += data_length
+        data = []
+        if atype == 2:
+            data, offset = decode_ns_type_data(message, offset, data_length)
+        if atype == 1:
+            data, offset = decode_a_type_data(message, offset, data_length)
+        if atype == 12:
+            data, offset = decode_ptr_data(message, offset, data_length)
         answer = {
-            "answer_name": name,
+            "answer_name": '.'.join(map(lambda x: x.decode(), name)),
             "answer_type": atype,
             "answer_class": ans_class,
             "ttl": ttl,
-            "data": data}
+            "data": data
+        }
         answers.append(answer)
     return answers, offset
 
@@ -163,11 +200,46 @@ def decode_dns_message(message):
     return result
 
 
-def get_dns_data(request):
+def get_dns_data(request, ip):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.sendto(request, ("10.98.240.10", 53))
-        ans, server = sock.recvfrom(1024)
+        sock.settimeout(1)
+        sock.sendto(request, (ip, 53))
+        try:
+            ans, server = sock.recvfrom(1024)
+        except socket.timeout:
+            return
         return ans
+
+
+class Cache:
+    @classmethod
+    def init_from(cls, filename, dns_ip):
+        if os.path.isfile(filename):
+            with open(filename, 'r') as f:
+                cache = cls(json.loads(f.read()))
+                return cache
+        else:
+            return Cache(filename, dns_ip)
+
+    def __init__(self, filename, dns_ip):
+        self.filename = filename
+        self.ns_cache = {}
+        self.dns_ip = dns_ip
+
+    def get(self, type: Literal['ns', 'ptr', 'a'], question: dict,
+            response: bytes) -> bytes or None:
+        if type == 'ns':
+            if not question['domain_name'] in self.ns_cache:
+                reply = get_dns_data(response, self.dns_ip)
+                if not reply:
+                    return
+                decoded_reply = decode_dns_message(reply)
+                for ans in decoded_reply['answers']:
+                    if ans['ttl'] > 0:
+                        self.ns_cache[ans['answer_name']] = self.ns_cache[
+                            'data']
+                        #         self.ns_cache[]
+    #   if type == ''
 
 
 def launch_sever():
@@ -179,9 +251,13 @@ def launch_sever():
 
             print('request:' + str(decode_dns_message(data)))
             print()
-            result = get_dns_data(data)
+            result = get_dns_data(data, "10.98.240.10")
+            if result is None:
+                print("Dns time out")
+                continue
             sock.sendto(result, addr)
-            print('reply: ' + str(decode_dns_message(result)))
+            print('reply: ' + json.dumps(decode_dns_message(result), indent=4,
+                                         default=str))
 
 
 if __name__ == '__main__':
