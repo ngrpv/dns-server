@@ -1,264 +1,212 @@
-import json
-import os.path
+#!/usr/bin/env python3
+
+import pickle
 import socket
 import struct
-from typing import Literal
-
-PORT = 53
-HOST = ""
-BUF_SIZE = 1024
+import time
+from typing import Dict
 
 
-def decode_labels(message, offset):
-    labels = []
+class DNSServer:
 
-    while True:
-        length, = struct.unpack_from("!B", message, offset)
-
-        if (length & 0xC0) == 0xC0:
-            pointer, = struct.unpack_from("!H", message, offset)
-            offset += 2
-
-            return labels + decode_labels(message, pointer & 0x3FFF)[0], offset
-
-        if (length & 0xC0) != 0x00:
-            raise AttributeError("unknown label encoding")
-
-        offset += 1
-
-        if length == 0:
-            return labels, offset
-
-        labels.append(*struct.unpack_from("!%ds" % length, message, offset))
-        offset += length
-
-
-DNS_QUERY_SECTION_FORMAT = struct.Struct("!2H")
-
-
-def decode_question_section(message, offset, qdcount):
-    questions = []
-
-    for _ in range(qdcount):
-        qname, offset = decode_labels(message, offset)
-
-        qtype, qclass = DNS_QUERY_SECTION_FORMAT.unpack_from(message, offset)
-        offset += DNS_QUERY_SECTION_FORMAT.size
-
-        question = {"domain_name": '.'.join(map(lambda x: x.decode(), qname)),
-                    "query_type": qtype,
-                    "query_class": qclass}
-
-        questions.append(question)
-
-    return questions, offset
-
-
-def decode_msg_until_co(message, offset):
-    labels = []
-    flag = False
-    start = offset
-    while True:
-        length, = struct.unpack_from("!B", message, offset)
-        offset += 1
-        if length == 0xC0:
-            flag = True
-            continue
-        if length == 0x0C and flag:
-            if len(labels) == 0:
-                return b'', offset
-            return struct.unpack_from("!%ds" % len(labels), message,
-                                      start), offset
-        flag = False
-        labels.append(chr(length))
-
-
-def parse_ip(data: bytes):
-    ip = []
-    for i in range(4):
-        ip.append(int(data[i]))
-    ''.join([str(i) for i in ip])
-
-
-A_Format = struct.Struct('!4B')
-
-DNS_ANS_EXTRA_FORMAT = struct.Struct('!IH')
-
-
-def parse_data_with_pointer(message: bytes, offset: int):
-    name_head = []
-    while True:
-        current_byte, = struct.unpack_from("!B", message, offset)
-        if current_byte == 3:
-            offset += 1
-            continue
-        if current_byte == 0xC0:
-            offset += 1
-            offset_to_name_tail, = struct.unpack_from("!B", message, offset)
-            name, _ = decode_labels(message, offset_to_name_tail)
-            if len(name_head) > 0:
-                return [str.encode(''.join(name_head))] + name, offset + 1
-            return name, offset + 1
-        name_head.append(chr(current_byte))
-        offset += 1
-
-
-def decode_ns_type_data(message, offset, data_length):
-    data, _ = parse_data_with_pointer(message, offset)
-    offset += data_length
-    return '.'.join(map(lambda x: x.decode(), data)), offset
-
-
-def decode_a_type_data(message, offset, data_length):
-    data = A_Format.unpack_from(message, offset)
-    return '.'.join(map(str, data)), offset + data_length
-
-
-def decode_ptr_data(message, offset, data_length):
-    off = offset
-    acc = []
-    i = 0
-    while True:
-        current_byte, = struct.unpack_from("!c", message, offset)
-        if current_byte == b'\x00' or offset >= off + data_length:
-            return ''.join(acc), off + data_length
-        if current_byte != b'\x03' and current_byte != b'\x05':
-            if str.isprintable(current_byte.decode()):
-                acc.append(current_byte.decode())
-        else:
-            acc.append('.')
-        offset += 1
-
-
-def decode_answers_section(message, offset, count, questions):
-    answers = []
-    for _ in range(count):
-        name, offset = parse_data_with_pointer(message, offset)
-        if name == b'':
-            name = questions[0]['domain_name']
-        atype, ans_class = DNS_QUERY_SECTION_FORMAT.unpack_from(message,
-                                                                offset)
-        offset += DNS_QUERY_SECTION_FORMAT.size
-        ttl, data_length = DNS_ANS_EXTRA_FORMAT.unpack_from(message, offset)
-        offset += DNS_ANS_EXTRA_FORMAT.size
-        data = []
-        if atype == 2:
-            data, offset = decode_ns_type_data(message, offset, data_length)
-        if atype == 1:
-            data, offset = decode_a_type_data(message, offset, data_length)
-        if atype == 12:
-            data, offset = decode_ptr_data(message, offset, data_length)
-        answer = {
-            "answer_name": '.'.join(map(lambda x: x.decode(), name)),
-            "answer_type": atype,
-            "answer_class": ans_class,
-            "ttl": ttl,
-            "data": data
-        }
-        answers.append(answer)
-    return answers, offset
-
-
-DNS_QUERY_MESSAGE_HEADER = struct.Struct("!6H")
-
-
-def decode_dns_message(message):
-    id, flags, questions_count, answers_count, num_of_authority_RR, num_of_additional_RRs = DNS_QUERY_MESSAGE_HEADER.unpack_from(
-        message)
-
-    qr = (flags & 0x8000) != 0
-    opcode = (flags & 0x7800) >> 11
-    aa = (flags & 0x0400) != 0
-    tc = (flags & 0x200) != 0
-    rd = (flags & 0x100) != 0
-    ra = (flags & 0x80) != 0
-    z = (flags & 0x70) >> 4
-    rcode = flags & 0xF
-
-    offset = DNS_QUERY_MESSAGE_HEADER.size
-    questions, offset = decode_question_section(message, offset,
-                                                questions_count)
-    answers, offset = decode_answers_section(message, offset, answers_count,
-                                             questions)
-
-    result = {"id": id,
-              "is_response": qr,
-              "opcode": opcode,
-              "is_authoritative": aa,
-              "is_truncated": tc,
-              "recursion_desired": rd,
-              "recursion_available": ra,
-              "reserved": z,
-              "response_code": rcode,
-              "question_count": questions_count,
-              "answer_count": answers_count,
-              "authority_count": num_of_authority_RR,
-              "additional_count": num_of_additional_RRs,
-              "questions": questions,
-              "answers": answers}
-
-    return result
-
-
-def get_dns_data(request, ip):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(1)
-        sock.sendto(request, (ip, 53))
+    def __init__(self, port, forwarder, cache_file):
+        self.port = port
+        self.forwarder = forwarder
+        self.cache_file = cache_file
         try:
-            ans, server = sock.recvfrom(1024)
-        except socket.timeout:
-            return
-        return ans
+            with open(self.cache_file, 'rb') as f:
+                self.cache = pickle.load(f)
+        except Exception:
+            self.cache: Dict[DNSQuery, list[DNSRecord]] = {}
+
+    def start(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.bind(('', self.port))
+            s.settimeout(1)
+            while True:
+                try:
+                    data, address = s.recvfrom(1024)
+                    print('Received')
+                    ans = self.__make_answer(data)
+                    print(ans)
+                    print(1)
+                    s.sendto(ans, address)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(e)
+                    continue
+
+    def __make_answer(self, incoming_data) -> bytes:
+        msg = DNSMessage.parse_message(incoming_data)
+        for question in msg.questions:
+            if not question in self.cache or self.cache[
+                question][0].exp_time < int(time.time()):
+                return self.__ask_forwarder(incoming_data)
+            if question.q_type == 6:
+                msg.authority[question] = self.cache[question]
+                msg.authority_RR += len(self.cache)
+            else:
+                msg.answers[question] = self.cache[question]
+                msg.answers_RR += len(self.cache)
+            print('From cache')
+        msg.flags = 0x8580
+        return msg.to_bytes()
+
+    def __ask_forwarder(self, bytes) -> bytes:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.connect(self.forwarder)
+            s.send(bytes)
+            data = s.recv(1024)
+            decoded = DNSMessage.parse_message(data)
+            self.cache.update(decoded.answers)
+            return data
+
+    def save_cache(self):
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.cache, f)
 
 
-class Cache:
-    @classmethod
-    def init_from(cls, filename, dns_ip):
-        if os.path.isfile(filename):
-            with open(filename, 'r') as f:
-                cache = cls(json.loads(f.read()))
-                return cache
+class DNSMessage:
+
+    def __init__(self):
+        self.authority = None
+        self.answers: Dict[DNSQuery, list[DNSRecord]] = {}
+        self.questions: list[DNSQuery] = []
+        self.additonal_RR = None
+        self.authority_RR = None
+        self.answers_RR = None
+        self.questions_RR = None
+        self.flags = None
+        self.id = None
+
+    @staticmethod
+    def parse_message(bytes) -> 'DNSMessage':
+        msg = DNSMessage()
+        (msg.id, msg.flags, msg.questions_RR,
+         msg.answers_RR, msg.authority_RR, msg.additonal_RR
+         ) = struct.unpack_from('!HHHHHH', bytes, 0)
+        msg.questions = []
+        msg.answers = {}
+        msg.authority = {}
+        offset = 12
+        for i in range(msg.questions_RR):
+            query, offset = DNSQuery.parse_query(bytes, offset)
+            msg.questions.append(query)
+        for i in range(msg.answers_RR + msg.authority_RR + msg.additonal_RR):
+            query, offset = DNSQuery.parse_query(bytes, offset)
+            record, offset = DNSRecord.parse_record(bytes, offset,
+                                                    query.q_type == 2)
+            if not query in msg.answers:
+                msg.answers[query] = []
+            msg.answers[query].append(record)
+        return msg
+
+    def to_bytes(self):
+        self.questions_RR = len(self.questions)
+        for i in self.answers.values():
+            self.answers_RR += len(i)
+        bytes = struct.pack('!HHHHHH',
+                            self.id,
+                            self.flags,
+                            self.questions_RR,
+                            self.answers_RR,
+                            self.authority_RR,
+                            self.additonal_RR
+                            )
+        for question in self.questions:
+            bytes += question.to_bytes()
+        for question in self.answers.keys():
+            for a in self.answers[question]:
+                bytes += question.to_bytes()
+                bytes += a.to_bytes()
+        for question in self.authority.keys():
+            for a in self.authority[question]:
+                bytes += question.to_bytes()
+                bytes += a.to_bytes()
+        return bytes
+
+
+class DNSQuery:
+
+    def __init__(self):
+        self.url = None
+        self.q_type = None
+
+    @staticmethod
+    def parse_query(bytes, offset) -> ('DNSQuery', int):
+        query = DNSQuery()
+        query.url, offset = parse_url(bytes, offset)
+        query.q_type, offset = parse_short(bytes, offset)
+        query.q_class, offset = parse_short(bytes, offset)
+        return (query, offset)
+
+    def to_bytes(self):
+        return url_to_bytes(self.url) + struct.pack('!HH', self.q_type,
+                                                    self.q_class)
+
+    def __hash__(self):
+        return hash(self.url) ** hash(self.q_type) ** hash(self.q_class)
+
+    def __eq__(x, y):
+        return x.url == y.url and x.q_type == y.q_type and x.q_class == y.q_class
+
+
+class DNSRecord:
+
+    @staticmethod
+    def parse_record(bytes, offset, is_link=False):
+        record = DNSRecord()
+        ttl, offset = parse_long(bytes, offset)
+        record.exp_time = int(time.time()) + ttl
+        length, offset = parse_short(bytes, offset)
+        if is_link:
+            record.info = url_to_bytes(parse_url(bytes, offset)[0])
         else:
-            return Cache(filename, dns_ip)
+            record.info = bytes[offset: offset + length]
+        return (record, offset + length)
 
-    def __init__(self, filename, dns_ip):
-        self.filename = filename
-        self.ns_cache = {}
-        self.dns_ip = dns_ip
-
-    def get(self, type: Literal['ns', 'ptr', 'a'], question: dict,
-            response: bytes) -> bytes or None:
-        if type == 'ns':
-            if not question['domain_name'] in self.ns_cache:
-                reply = get_dns_data(response, self.dns_ip)
-                if not reply:
-                    return
-                decoded_reply = decode_dns_message(reply)
-                for ans in decoded_reply['answers']:
-                    if ans['ttl'] > 0:
-                        self.ns_cache[ans['answer_name']] = self.ns_cache[
-                            'data']
-                        #         self.ns_cache[]
-    #   if type == ''
+    def to_bytes(self):
+        return struct.pack('!IH', self.exp_time - int(time.time()),
+                           len(self.info)) + self.info
 
 
-def launch_sever():
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind((HOST, PORT))
-        while True:
-            data, addr = sock.recvfrom(BUF_SIZE)
-            print(decode_dns_message(data))
+def parse_short(bytes, offset):
+    return (struct.unpack_from('!H', bytes, offset)[0], offset + 2)
 
-            print('request:' + str(decode_dns_message(data)))
-            print()
-            result = get_dns_data(data, "10.98.240.10")
-            if result is None:
-                print("Dns time out")
-                continue
-            sock.sendto(result, addr)
-            print('reply: ' + json.dumps(decode_dns_message(result), indent=4,
-                                         default=str))
+
+def parse_long(bytes, offset):
+    return (struct.unpack_from('!I', bytes, offset)[0], offset + 4)
+
+
+def parse_url(bytes, offset, recursive=False):
+    url = ''
+    while bytes[offset] != 0 and bytes[offset] < 0x80:
+        for i in range(1, bytes[offset] + 1):
+            url += chr(bytes[offset + i])
+        url += '.'
+        offset += bytes[offset] + 1
+    if bytes[offset] >= 0x80:
+        end_offset = parse_short(bytes, offset)[0] & 0x1fff
+        url += parse_url(bytes, end_offset, True)[0]
+        offset += 1
+    if not recursive:
+        url = url[:-1]
+    return (url, offset + 1)
+
+
+def url_to_bytes(url):
+    bytes = b''
+    for part in url.split('.'):
+        bytes += struct.pack('B', len(part))
+        bytes += part.encode(encoding='utf-8')
+    return bytes + b'\0'
 
 
 if __name__ == '__main__':
-    launch_sever()
+    server = DNSServer(53, ('77.88.8.8', 53), 'cache')
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.save_cache()
