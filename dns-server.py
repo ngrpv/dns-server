@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-
 from dns_server import DNSServer
+from settings import *
 
 if __name__ == '__main__':
-    server = DNSServer(53, ('216.239.32.10', 53), 'cache')
+    server = DNSServer(PORT, (DEFAULT_DNS_IP, PORT), CACHE_FILE_NAME)
     try:
         server.start()
     except KeyboardInterrupt:
