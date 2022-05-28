@@ -1,3 +1,4 @@
+import json
 import pickle
 import socket
 import time
@@ -28,6 +29,7 @@ class DNSServer:
                 try:
                     data, address = s.recvfrom(1024)
                     ans = self.__make_answer(data)
+                    #    print(ans)
                     s.sendto(ans, address)
                 except socket.timeout:
                     continue
@@ -43,22 +45,16 @@ class DNSServer:
                 return self.__ask_forwarder(incoming_data)
             if question.q_type == 6:
                 msg.authority[question] = self.cache[question]
-                msg.authority_RR += len(self.cache)
+                msg.authority_RR += len(self.cache[question])
             else:
-                if question.q_type == 2:
-                    question2 = DNSQuery()
-                    question2.q_type = 1
-                    question2.q_class = question.q_class
-                    question2.url = 'ns1.' + question.url
-                    if not question in msg.additional:
-                        msg.additional[question] = []
-                    msg.additional[question] += self.cache.get(question2, [])
-                    question2.q_type = 28
-                    msg.additional[question] += self.cache.get(question2, [])
                 msg.answers[question] = self.cache[question]
+                msg.answers_RR += len(self.cache[question])
             print('From cache')
         msg.flags = 0x8580
         return msg.to_bytes()
+
+    def _get_records(self, q_name, q_type, q_class):
+        pass
 
     def __ask_forwarder(self, bytes) -> bytes:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:

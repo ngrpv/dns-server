@@ -55,13 +55,15 @@ class DNSMessage:
         return msg
 
     def to_bytes(self):
+        self.authority_RR = 0
         self.questions_RR = len(self.questions)
         for i in self.answers.values():
             self.answers_RR += len(i)
-        for i in self.authority.values():
+        for _, i in self.authority.items():
             self.authority_RR += len(i)
         for i in self.additional.values():
             self.additonal_RR += len(i)
+        #    print('aaa', self.authority_RR)
         bytes = struct.pack('!HHHHHH',
                             self.id,
                             self.flags,

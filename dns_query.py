@@ -20,5 +20,5 @@ class DNSQuery:
     def __hash__(self):
         return hash(self.url) ** hash(self.q_type) ** hash(self.q_class)
 
-    def __eq__(x, y):
-        return x.url == y.url and x.q_type == y.q_type and x.q_class == y.q_class
+    def __eq__(self, other):
+        return self.url == other.url and self.q_type == other.q_type and self.q_class == other.q_class
